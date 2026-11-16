@@ -88,6 +88,38 @@ class PublishBusy(Exception):
     """Another publication held the write lock for longer than the timeout."""
 
 
+class AccumulationError(Exception):
+    """A multi-day accumulation could not be completed.
+
+    The whole request fails: a missing day, a missing image file or a
+    unreadable/corrupt source all produce this instead of a partial result.
+    """
+
+    def __init__(self, code: str, message: str, *, day: str | None = None):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.day = day
+
+    def as_detail(self) -> dict[str, Any]:
+        detail: dict[str, Any] = {"code": self.code, "message": self.message}
+        if self.day is not None:
+            detail["day"] = self.day
+        return detail
+
+
+@dataclass(frozen=True)
+class SelectedVersion:
+    """One version chosen for an accumulation, read from a single snapshot."""
+
+    day: str
+    version: int
+    path: Path
+    published_at: str
+    sha256: str
+    size_bytes: int
+
+
 @dataclass(frozen=True)
 class DownloadRecord:
     version: int
@@ -276,6 +308,61 @@ def list_versions(
         return [_row_to_payload(row) for row in rows], int(total)
     finally:
         conn.close()
+
+
+def select_daily_versions(settings: Settings, days: list[str]) -> list[SelectedVersion]:
+    """Pick the newest version of every day in ``days`` from one DB snapshot.
+
+    A single read-only connection is opened and all rows are read from it, so
+    every choice comes from the same SQLite snapshot; a publication that lands
+    while the accumulation runs simply becomes a later version that this
+    request never sees.  The immutable version files are then checked on disk.
+
+    The function fails the whole request (no partial image) when a day has no
+    version or when its registered file is missing.
+    """
+
+    conn = connect(settings)
+    try:
+        rows: dict[str, sqlite3.Row] = {}
+        for day in days:
+            row = conn.execute(
+                "SELECT * FROM versions WHERE day = ? ORDER BY version DESC LIMIT 1",
+                (day,),
+            ).fetchone()
+            if row is None:
+                raise AccumulationError(
+                    "day_not_published",
+                    f"no published mosaic version exists for day {day}",
+                    day=day,
+                )
+            rows[day] = row
+    finally:
+        conn.close()
+
+    selected: list[SelectedVersion] = []
+    for day in days:
+        row = rows[day]
+        version = int(row["version"])
+        path = settings.versions_dir / f"v{version}.tif"
+        if not path.is_file():
+            log.error("image for version %s (%s) is missing at %s", version, day, path)
+            raise AccumulationError(
+                "source_image_missing",
+                f"image file for day {day} version {version} is unavailable on disk",
+                day=day,
+            )
+        selected.append(
+            SelectedVersion(
+                day=day,
+                version=version,
+                path=path,
+                published_at=row["published_at"],
+                sha256=row["sha256"],
+                size_bytes=int(row["size_bytes"]),
+            )
+        )
+    return selected
 
 
 def get_download(settings: Settings, version: int) -> DownloadRecord | None:

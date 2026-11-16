@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+import uuid
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -16,7 +17,8 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
-from . import __version__, store
+from . import __version__, accumulation, store
+from .accumulation import ACCUM_COVERAGE_THRESHOLD
 from .config import Settings, load_settings
 from .limits import BodyLimitMiddleware
 from .rasters import RasterInputError, load_block, validate_pair
@@ -49,6 +51,42 @@ def parse_day(raw: str) -> str:
             },
         )
     return value
+
+
+# An accumulation spans the two-to-three consecutive UTC days a hydrologist
+# needs for flood-model forcing.
+MIN_ACCUM_DAYS = 2
+MAX_ACCUM_DAYS = 3
+
+
+def parse_day_range(start_day: str, end_day: str) -> list[str]:
+    """Validate the UTC date range and return the inclusive list of days."""
+
+    start_value = parse_day(start_day)
+    end_value = parse_day(end_day)
+    start = date.fromisoformat(start_value)
+    end = date.fromisoformat(end_value)
+    if end < start:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_range",
+                "message": "end_day must not be earlier than start_day",
+            },
+        )
+    span = (end - start).days + 1
+    if span < MIN_ACCUM_DAYS or span > MAX_ACCUM_DAYS:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "invalid_range",
+                "message": (
+                    f"an accumulation covers {MIN_ACCUM_DAYS} to {MAX_ACCUM_DAYS} "
+                    f"consecutive UTC days; got {span}"
+                ),
+            },
+        )
+    return [(start + timedelta(days=offset)).isoformat() for offset in range(span)]
 
 
 def parse_captured_at(raw: str, slot: str) -> datetime:
@@ -490,7 +528,178 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         return _file_response(record)
 
+    @app.get(
+        "/api/v1/accumulations",
+        tags=["accumulations"],
+        summary="Accumulate the newest published mosaics of 2-3 consecutive UTC days",
+        description=(
+            "Selects, from one database snapshot, the newest published mosaic "
+            "version of every UTC day in the inclusive range `start_day`..`end_day` "
+            "(2 to 3 consecutive days). The first day's image grid (CRS, "
+            "resolution, footprint) is the target grid; other days may use a "
+            "different CRS, resolution and coverage and are regridded onto it.\n\n"
+            "For each target pixel, every day contributes an area-weighted mean "
+            "of its valid source pixels. If any day covers less than 90% of a "
+            "target pixel with valid pixels, that pixel is output as NoData "
+            "(NaN); otherwise the daily means are summed. The output is a "
+            "single-band float32 GeoTIFF with NaN NoData, accompanied by the "
+            "list of days and version numbers actually used.\n\n"
+            "A missing day, a missing source file or a corrupt/unreadable "
+            "source fails the whole request — no partial image is returned. "
+            "Versions published while the calculation is running are ignored: "
+            "this response only uses the versions selected from the opening "
+            "snapshot. Existing mosaic publication and downloads are unaffected.\n\n"
+            "`format=tiff` (default) streams the GeoTIFF; `format=json` returns "
+            "the same result as metadata, including the selected day/version "
+            "list and per-day coverage statistics."
+        ),
+        responses={
+            200: {"description": "Accumulated GeoTIFF (or metadata when format=json)"},
+            404: {"description": "No published version for one of the days"},
+            410: {"description": "A selected source image is missing on disk"},
+            422: {"description": "Invalid range or unreadable/corrupt source raster"},
+            500: {"description": "Accumulation could not be rendered"},
+        },
+    )
+    async def accumulate(
+        request: Request,
+        start_day: Annotated[
+            str, Query(description="First UTC day, YYYY-MM-DD")
+        ],
+        end_day: Annotated[
+            str, Query(description="Last UTC day, YYYY-MM-DD (inclusive; 2-3 days total)")
+        ],
+        format: Annotated[
+            str, Query(description="tiff streams the GeoTIFF; json returns metadata only")
+        ] = "tiff",
+    ):
+        if format not in ("tiff", "json"):
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "invalid_format",
+                    "message": "format must be 'tiff' or 'json'",
+                },
+            )
+        days = parse_day_range(start_day, end_day)
+        current_settings = get_settings(request)
+
+        def work() -> dict[str, Any]:
+            # 1. One snapshot, one newest version per day; fail wholesale on a
+            #    missing day or missing file.
+            try:
+                selected = store.select_daily_versions(current_settings, days)
+            except store.AccumulationError as exc:
+                status = 410 if exc.code == "source_image_missing" else 404
+                raise HTTPException(status_code=status, detail=exc.as_detail()) from exc
+
+            # 2. Open and validate every selected immutable source before any
+            #    pixel math, so a corrupt file fails the whole request.
+            try:
+                sources = [accumulation.load_daily_source(item) for item in selected]
+            except accumulation.AccumulationRasterError as exc:
+                raise HTTPException(status_code=422, detail=exc.as_detail()) from exc
+
+            # 3. Render to a scratch file and verify it by re-opening.
+            result = accumulation.build_accumulation(sources)
+            temp_path = current_settings.tmp_dir / f"accum-{uuid.uuid4().hex}.tif"
+            try:
+                info = accumulation.write_accumulation(result, temp_path)
+                accumulation.verify_accumulation(temp_path, info)
+                store._fsync_file(temp_path)
+                sha256 = accumulation.sha256_file(temp_path)
+                size_bytes = temp_path.stat().st_size
+            except Exception as exc:
+                temp_path.unlink(missing_ok=True)
+                log.exception("accumulation rendering failed")
+                raise HTTPException(
+                    status_code=500,
+                    detail={
+                        "code": "accumulation_failed",
+                        "message": (
+                            "the accumulation could not be rendered; "
+                            "no partial image is returned"
+                        ),
+                    },
+                ) from exc
+
+            payload = {
+                "start_day": days[0],
+                "end_day": days[-1],
+                "days": days,
+                "coverage_threshold": ACCUM_COVERAGE_THRESHOLD,
+                "image": {
+                    "width": info.width,
+                    "height": info.height,
+                    "dtype": info.dtype,
+                    "nodata": "NaN",
+                    "crs": info.crs.to_string() or info.crs.to_wkt(),
+                    "crs_wkt": info.crs.to_wkt(),
+                    "transform": list(info.transform)[:6],
+                    "bounds": list(info.bounds),
+                    "res_x": info.res_x,
+                    "res_y": info.res_y,
+                    "sha256": sha256,
+                    "size_bytes": size_bytes,
+                    "nodata_pixel_fraction": result.nodata_pixel_fraction,
+                },
+                "sources": [
+                    {
+                        "day": item.day,
+                        "version": item.version,
+                        "published_at": item.published_at,
+                        "sha256": item.sha256,
+                        "covered_pixel_fraction": contribution.covered_pixel_fraction,
+                        "qualifying_pixel_fraction": contribution.qualifying_pixel_fraction,
+                    }
+                    for item, contribution in zip(selected, result.contributions)
+                ],
+                "download_url": (
+                    f"/api/v1/accumulations?start_day={days[0]}&end_day={days[-1]}&format=tiff"
+                ),
+                "_temp_path": str(temp_path),
+            }
+            return payload
+
+        payload = await run_in_threadpool(work)
+        temp_path = Path(payload.pop("_temp_path"))
+        filename = f"rainfall-accumulation-{payload['start_day']}_{payload['end_day']}.tif"
+
+        if format == "json":
+            return _json_then_delete(temp_path, payload)
+
+        from starlette.background import BackgroundTask
+
+        return FileResponse(
+            path=temp_path,
+            media_type="image/tiff",
+            filename=filename,
+            background=BackgroundTask(_safe_unlink, temp_path),
+            headers={
+                "ETag": f'"{payload["image"]["sha256"]}"',
+                "X-Accumulation-Days": ",".join(payload["days"]),
+                "X-Accumulation-Versions": ",".join(
+                    str(item["version"]) for item in payload["sources"]
+                ),
+                "X-Accumulation-Coverage-Threshold": str(ACCUM_COVERAGE_THRESHOLD),
+                "Cache-Control": "no-store",
+            },
+        )
+
     return app
+
+
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        log.warning("could not remove temporary accumulation file %s", path, exc_info=True)
+
+
+def _json_then_delete(temp_path: Path, payload: dict[str, Any]) -> JSONResponse:
+    response = JSONResponse(payload)
+    _safe_unlink(temp_path)
+    return response
 
 
 def _file_response(record: store.DownloadRecord) -> FileResponse:

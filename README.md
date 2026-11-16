@@ -28,9 +28,11 @@ them). Change the host port with `RAINMOSAIC_PUBLISHED_PORT=9000 docker compose 
 | GET | `/api/v1/mosaics/{version}` | Metadata for a fixed version |
 | GET | `/api/v1/mosaics/{version}/download` | GeoTIFF for a fixed version |
 | GET | `/api/v1/download/current` | GeoTIFF for the current version |
+| GET | `/api/v1/accumulations` | Accumulate the newest mosaics of 2-3 consecutive UTC days |
 | GET | `/healthz` | Liveness, database and current-version check |
 
-`/docs` supports submitting (multipart form), browsing and downloading.
+`/docs` supports submitting (multipart form), browsing and downloading, and
+firing accumulation requests.
 
 ### Submitting
 
@@ -73,6 +75,46 @@ block is NoData the other block's value is used; equal instants are broken by
 the larger block number. Pixels covered by neither block stay `-32768`. Output
 is a single-band `int16` GeoTIFF with the block CRS/resolution and NoData
 declared as `-32768`.
+
+### Multi-day accumulation
+
+Hydrologists combine the published rainfall images of two or three consecutive
+UTC days into one cumulative rainfall image for the flood model:
+
+```bash
+curl "http://localhost:8000/api/v1/accumulations?start_day=2026-01-01&end_day=2026-01-02" \
+  -o rainfall-accumulation-2026-01-01_2026-01-02.tif
+# Metadata only (same selection and coverage statistics, no image bytes):
+curl "http://localhost:8000/api/v1/accumulations?start_day=2026-01-01&end_day=2026-01-03&format=json"
+```
+
+* **Inputs** — the inclusive UTC range `start_day`..`end_day`, which must span
+  2 to 3 consecutive days. From one database snapshot the service picks the
+  newest published version of *each* day. A version published while the
+  calculation runs is ignored by that request, which only ever uses the
+  versions chosen from its opening snapshot.
+* **Target grid** — the first day's image grid (CRS, resolution, footprint).
+  Other days may use a different CRS, resolution and coverage and are
+  regridded onto that grid.
+* **Per-pixel rule** — every day contributes an area-weighted mean of the
+  valid source pixels intersecting each target pixel. If any day covers less
+  than **90%** of a target pixel with valid pixels, the pixel is output as
+  NoData; otherwise the daily means are summed. Same-CRS overlaps are computed
+  with exact affine intersection math; cross-CRS sources use GDAL's
+  area-weighted average resampling.
+* **Output** — a single-band **float32 GeoTIFF with NoData = NaN**, plus the
+  list of days and version numbers used (in the JSON body and the
+  `X-Accumulation-*` response headers), per-day coverage statistics and the
+  output NoData-pixel fraction.
+* **All-or-nothing failures** — a missing day, a missing source file or a
+  corrupt/unreadable source fails the whole request; no partial image is ever
+  returned. Errors are `404 day_not_published`, `410 source_image_missing`,
+  `422 source_raster_error` / `invalid_range` / `invalid_day`, or
+  `500 accumulation_failed`.
+* **No side effects** — accumulation is read-only. It never creates a version,
+  moves the current pointer or changes an existing file, so mosaic
+  publication and downloads keep working unchanged. The rendered image is
+  streamed from a scratch file that is deleted once the response completes.
 
 ### Versioning and concurrency
 
@@ -123,7 +165,12 @@ python -m pytest -q
 The test suite covers the mosaic rules (overlap priority, NoData fallback, tie
 break, gaps, alignment/CRS/size validation), publishing, version pinning,
 conflicts, concurrent submissions, failed generation, downloads during
-publication, restart persistence, listing/pagination and error handling.
+publication, restart persistence, listing/pagination and error handling. It
+also covers the accumulation end to end: snapshot-based newest-version
+selection, area-weighted regridding (same-CRS exact intersection and
+cross-CRS warp), the 90% coverage / NaN rule, float32 NaN GeoTIFF output,
+day/version reporting, missing-day/missing-file/corrupt-source failures,
+in-flight publication isolation and temp-file cleanup.
 
 ## Configuration
 
